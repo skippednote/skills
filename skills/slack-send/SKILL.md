@@ -19,6 +19,21 @@ unset), surface that; don't silently fall back to MCP.
 Read-side actions (search, read channel/thread, canvas reads) are not
 touched by this skill — keep using MCP for those.
 
+## Before sending — verify the destination
+
+The user's own words for a channel/handle are often approximate (missing
+prefix like `eng-`, typo'd suffix, different capitalisation). Resolve
+before drafting; don't resolve on send.
+
+- Run `slack resolve <name>` first. On a miss the script prints the
+  closest substring matches from channels the user is in — read them back
+  and confirm which one.
+- If the user gave only a vague description ("the PE stream channel"), use
+  the Slack search MCP to find the exact channel first, then pass the
+  resolved id (or confirmed `#name`) to `slack send`.
+- Prefer raw ids (`C...`, `D...`, `U...`) in loops or scripts — no API
+  round-trip, no rate-limit exposure.
+
 ## The helper
 
 Use `scripts/slack` from this skill directory. It is a self-contained Python
@@ -45,13 +60,21 @@ slack raw     METHOD  [--field key=value]...   # escape hatch for any Slack meth
 
 `CHANNEL` and `TARGET` accept:
 
-- `#name` — public or private channel name, resolved via `conversations.list`
-- `@handle` — user handle or display name, resolved via `users.list`, DM opened
-- `someone@example.com` — email, resolved via `users.lookupByEmail`, DM opened
+- `#name` — channel the user is in, resolved via `users.conversations`
+  (not `conversations.list`, which is heavily rate-limited). Only channels
+  the user is a member of resolve this way — which is also the set the
+  user token can post to as the user.
+- `@handle` — user handle or display name, resolved via `users.list`, DM
+  opened via `conversations.open`.
+- `someone@example.com` — email, resolved via `users.lookupByEmail`, DM opened.
 - raw id — `C...` channel, `G...` group, `D...` DM, or `U...`/`W...` user
-  (user ids auto-open a DM)
+  (user ids auto-open a DM). Prefer this in loops.
 
-Resolution hits the Slack API; prefer raw ids in loops.
+Name→id lookups are cached at `~/.cache/slack-send/{channels,users}.json`
+so repeated runs don't re-page. On rename, run `slack cache --clear`.
+
+Rate-limited calls (HTTP 429 or `error: ratelimited`) are retried once,
+honoring Slack's `Retry-After`.
 
 ### Blocks
 
@@ -104,11 +127,18 @@ response names the needed scope — add it at api.slack.com/apps and
 re-install. Common scopes:
 
 - `chat:write` — send, update, delete your own messages
+- `chat:write:bot` — some workspaces require this on the user token too;
+  if a send errors `missing_scope: chat:write:bot`, add it and reinstall
 - `im:write`, `im:read` — open and post DMs
 - `users:read`, `users:read.email` — resolve `@handle` and email targets
-- `channels:read`, `groups:read` — resolve `#name` channels
+- `channels:read`, `groups:read` — resolve `#name` channels (needed by
+  `users.conversations`)
 - `reactions:write` — add/remove reactions
 - `files:write` — upload files
+
+The user token can only post to channels the user is a member of. A
+"channel not found" error from `slack send` on a channel that visibly
+exists usually means the user needs to join it first (or send via bot).
 
 ## When to invoke this skill
 

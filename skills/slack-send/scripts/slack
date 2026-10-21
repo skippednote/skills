@@ -16,12 +16,17 @@ import mimetypes
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 API = "https://slack.com/api"
+
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "slack-send"
+CHANNEL_CACHE = CACHE_DIR / "channels.json"
+USER_CACHE = CACHE_DIR / "users.json"
 
 # Default 1Password reference for the Slack user token. Env vars override:
 #   SLACK_USER_TOKEN_OP_REF      — the op:// URI to read
@@ -57,10 +62,11 @@ def get_token() -> str:
     )
 
 
-def call(method: str, token: str, **params) -> dict:
+def call(method: str, token: str, _retries: int = 2, **params) -> dict:
     """POST to a Slack method with form-urlencoded body.
 
-    Dict/list values are JSON-encoded; None values are dropped.
+    Dict/list values are JSON-encoded; None values are dropped. Retries once
+    on HTTP 429 and on `ratelimited` body errors, honoring Retry-After.
     """
     body: dict[str, str] = {}
     for k, v in params.items():
@@ -81,9 +87,35 @@ def call(method: str, token: str, **params) -> dict:
     )
     try:
         with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
+            result = json.loads(resp.read())
+            if not result.get("ok") and result.get("error") == "ratelimited" and _retries > 0:
+                wait = int(resp.headers.get("Retry-After", "1") or "1")
+                print(f"slack: ratelimited on {method}, sleeping {wait}s", file=sys.stderr)
+                time.sleep(min(wait, 30))
+                return call(method, token, _retries=_retries - 1, **params)
+            return result
     except urllib.error.HTTPError as e:
+        if e.code == 429 and _retries > 0:
+            wait = int(e.headers.get("Retry-After", "1") or "1")
+            print(f"slack: 429 on {method}, sleeping {wait}s", file=sys.stderr)
+            time.sleep(min(wait, 30))
+            return call(method, token, _retries=_retries - 1, **params)
         return {"ok": False, "error": f"http_{e.code}", "body": e.read().decode(errors="replace")}
+
+
+def load_cache(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_cache(path: Path, data: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+    except OSError:
+        pass
 
 
 def must(result: dict) -> dict:
@@ -113,37 +145,72 @@ def resolve_channel(token: str, target: str) -> str:
 
 
 def find_user(token: str, handle: str) -> str:
+    cache = load_cache(USER_CACHE)
+    if handle in cache:
+        return cache[handle]
     cursor = ""
+    seen: dict[str, str] = {}
     while True:
         r = must(call("users.list", token, cursor=cursor or None, limit=200))
         for u in r.get("members", []):
             name = u.get("name", "")
             display = u.get("profile", {}).get("display_name", "")
+            uid = u["id"]
+            if name:
+                seen[name] = uid
+            if display:
+                seen[display] = uid
             if name == handle or display == handle:
-                return u["id"]
+                cache.update(seen)
+                save_cache(USER_CACHE, cache)
+                return uid
         cursor = r.get("response_metadata", {}).get("next_cursor", "")
         if not cursor:
             break
-    sys.exit(f"slack: user @{handle} not found")
+    cache.update(seen)
+    save_cache(USER_CACHE, cache)
+    matches = [n for n in seen if handle in n or n in handle][:5]
+    hint = f" Did you mean: {', '.join(matches)}?" if matches else ""
+    sys.exit(f"slack: user @{handle} not found.{hint}")
 
 
 def find_channel(token: str, name: str) -> str:
+    """Resolve a channel name to id.
+
+    Uses `users.conversations` so we only page through channels the user is in
+    — which is both much smaller than `conversations.list` and semantically
+    the only set the user token can post to as the user. Results are cached
+    at `~/.cache/slack-send/channels.json`.
+    """
+    cache = load_cache(CHANNEL_CACHE)
+    if name in cache:
+        return cache[name]
     cursor = ""
+    seen: dict[str, str] = {}
     while True:
         r = must(call(
-            "conversations.list", token,
+            "users.conversations", token,
             cursor=cursor or None,
             types="public_channel,private_channel",
-            limit=200,
+            limit=1000,
             exclude_archived="true",
         ))
         for c in r.get("channels", []):
-            if c.get("name") == name:
+            cname = c.get("name", "")
+            if cname:
+                seen[cname] = c["id"]
+            if cname == name:
+                cache.update(seen)
+                save_cache(CHANNEL_CACHE, cache)
                 return c["id"]
         cursor = r.get("response_metadata", {}).get("next_cursor", "")
         if not cursor:
             break
-    sys.exit(f"slack: channel #{name} not found")
+    cache.update(seen)
+    save_cache(CHANNEL_CACHE, cache)
+    matches = [n for n in seen if name in n or n in name][:5]
+    hint = f" Did you mean: {', '.join(matches)}?" if matches else ""
+    sys.exit(f"slack: channel #{name} not found in {len(seen)} channels you're in.{hint}")
 
 
 def open_dm(token: str, user_id: str) -> str:
@@ -256,6 +323,23 @@ def cmd_whoami(args, token):
     print(json.dumps({k: r[k] for k in ("user", "user_id", "team", "team_id", "url") if k in r}))
 
 
+def cmd_cache(args, token):
+    """Inspect or clear the local name→id cache."""
+    if args.clear:
+        for p in (CHANNEL_CACHE, USER_CACHE):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+        print(json.dumps({"ok": True, "cleared": [str(CHANNEL_CACHE), str(USER_CACHE)]}))
+        return
+    print(json.dumps({
+        "dir": str(CACHE_DIR),
+        "channels": len(load_cache(CHANNEL_CACHE)),
+        "users": len(load_cache(USER_CACHE)),
+    }, indent=2))
+
+
 def cmd_raw(args, token):
     """Call any Slack method with --field key=value pairs. JSON values accepted."""
     params = {}
@@ -336,6 +420,10 @@ def main():
 
     s = sub.add_parser("whoami", help="print auth.test result")
     s.set_defaults(fn=cmd_whoami)
+
+    s = sub.add_parser("cache", help="inspect the local name→id cache; --clear to wipe it")
+    s.add_argument("--clear", action="store_true")
+    s.set_defaults(fn=cmd_cache)
 
     s = sub.add_parser("raw", help="call any Slack method, e.g. raw conversations.history --field channel=C123")
     s.add_argument("method")
