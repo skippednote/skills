@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""Send Slack messages with a user token, bypassing MCP.
+
+Token resolution order:
+  1. `op read "$SLACK_USER_TOKEN_OP_REF"` if the ref is set and op is signed in.
+  2. `$SLACK_USER_TOKEN` from env.
+  3. Fail with setup instructions.
+
+Only the Python stdlib is used; no third-party deps.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+API = "https://slack.com/api"
+
+# Default 1Password reference for the Slack user token. Env vars override:
+#   SLACK_USER_TOKEN_OP_REF      — the op:// URI to read
+#   SLACK_USER_TOKEN_OP_ACCOUNT  — the op account (UUID, shorthand, or domain)
+#   SLACK_USER_TOKEN             — a raw token, bypasses op entirely
+DEFAULT_OP_REF = "op://bxbxnwjh3l7ci7vsz6rq76sbeu/iep7scodq754cixl4cr25whjga/notesPlain"
+DEFAULT_OP_ACCOUNT = "my.1password.com"
+
+
+def get_token() -> str:
+    ref = os.environ.get("SLACK_USER_TOKEN_OP_REF", "").strip() or DEFAULT_OP_REF
+    account = os.environ.get("SLACK_USER_TOKEN_OP_ACCOUNT", "").strip() or DEFAULT_OP_ACCOUNT
+    if ref:
+        cmd = ["op", "read", ref]
+        if account:
+            cmd[1:1] = ["--account", account]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            tok = r.stdout.strip()
+            if tok:
+                return tok
+        except FileNotFoundError:
+            pass
+        except subprocess.CalledProcessError as e:
+            print(f"slack-send: op read failed ({e.stderr.strip()}); falling back to env", file=sys.stderr)
+    tok = os.environ.get("SLACK_USER_TOKEN", "").strip()
+    if tok:
+        return tok
+    sys.exit(
+        "slack-send: no token.\n"
+        "  Set SLACK_USER_TOKEN_OP_REF='op://Vault/Item/field' and sign into op,\n"
+        "  or export SLACK_USER_TOKEN=xoxp-..."
+    )
+
+
+def call(method: str, token: str, **params) -> dict:
+    """POST to a Slack method with form-urlencoded body.
+
+    Dict/list values are JSON-encoded; None values are dropped.
+    """
+    body: dict[str, str] = {}
+    for k, v in params.items():
+        if v is None:
+            continue
+        if isinstance(v, (dict, list)):
+            body[k] = json.dumps(v)
+        else:
+            body[k] = str(v)
+    req = urllib.request.Request(
+        f"{API}/{method}",
+        data=urllib.parse.urlencode(body).encode(),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": f"http_{e.code}", "body": e.read().decode(errors="replace")}
+
+
+def must(result: dict) -> dict:
+    if not result.get("ok"):
+        sys.exit(f"slack error: {json.dumps(result)}")
+    return result
+
+
+def resolve_channel(token: str, target: str) -> str:
+    """Convert #name, @handle, email, or raw id to a channel id usable for messaging."""
+    t = target.strip()
+    if not t:
+        sys.exit("slack: empty target")
+    first = t[0]
+    if first in ("C", "G", "D"):
+        return t
+    if first in ("U", "W"):
+        return open_dm(token, t)
+    if first == "@":
+        return open_dm(token, find_user(token, t[1:]))
+    if "@" in t and "." in t.split("@", 1)[1]:
+        r = must(call("users.lookupByEmail", token, email=t))
+        return open_dm(token, r["user"]["id"])
+    if first == "#":
+        t = t[1:]
+    return find_channel(token, t)
+
+
+def find_user(token: str, handle: str) -> str:
+    cursor = ""
+    while True:
+        r = must(call("users.list", token, cursor=cursor or None, limit=200))
+        for u in r.get("members", []):
+            name = u.get("name", "")
+            display = u.get("profile", {}).get("display_name", "")
+            if name == handle or display == handle:
+                return u["id"]
+        cursor = r.get("response_metadata", {}).get("next_cursor", "")
+        if not cursor:
+            break
+    sys.exit(f"slack: user @{handle} not found")
+
+
+def find_channel(token: str, name: str) -> str:
+    cursor = ""
+    while True:
+        r = must(call(
+            "conversations.list", token,
+            cursor=cursor or None,
+            types="public_channel,private_channel",
+            limit=200,
+            exclude_archived="true",
+        ))
+        for c in r.get("channels", []):
+            if c.get("name") == name:
+                return c["id"]
+        cursor = r.get("response_metadata", {}).get("next_cursor", "")
+        if not cursor:
+            break
+    sys.exit(f"slack: channel #{name} not found")
+
+
+def open_dm(token: str, user_id: str) -> str:
+    r = must(call("conversations.open", token, users=user_id))
+    return r["channel"]["id"]
+
+
+def parse_blocks(src: str | None):
+    if src is None:
+        return None
+    s = src.strip()
+    if s.startswith("[") or s.startswith("{"):
+        return json.loads(s)
+    return json.loads(Path(s).read_text())
+
+
+def post(token: str, channel: str, text: str, thread: str | None = None, blocks=None) -> dict:
+    r = must(call(
+        "chat.postMessage", token,
+        channel=channel, text=text,
+        thread_ts=thread, blocks=blocks,
+    ))
+    return {"ok": True, "channel": r["channel"], "ts": r["ts"]}
+
+
+def cmd_send(args, token):
+    channel = resolve_channel(token, args.channel)
+    print(json.dumps(post(token, channel, args.text, args.thread, parse_blocks(args.blocks))))
+
+
+def cmd_dm(args, token):
+    t = args.target
+    if not t.startswith(("@", "U", "W")) and "@" not in t:
+        t = "@" + t
+    channel = resolve_channel(token, t)
+    print(json.dumps(post(token, channel, args.text, args.thread, parse_blocks(args.blocks))))
+
+
+def cmd_reply(args, token):
+    channel = resolve_channel(token, args.channel)
+    print(json.dumps(post(token, channel, args.text, args.thread_ts, parse_blocks(args.blocks))))
+
+
+def cmd_update(args, token):
+    channel = resolve_channel(token, args.channel)
+    r = must(call(
+        "chat.update", token,
+        channel=channel, ts=args.ts, text=args.text,
+        blocks=parse_blocks(args.blocks),
+    ))
+    print(json.dumps({"ok": True, "channel": r["channel"], "ts": r["ts"]}))
+
+
+def cmd_delete(args, token):
+    channel = resolve_channel(token, args.channel)
+    must(call("chat.delete", token, channel=channel, ts=args.ts))
+    print(json.dumps({"ok": True}))
+
+
+def cmd_react(args, token):
+    channel = resolve_channel(token, args.channel)
+    method = "reactions.remove" if args.remove else "reactions.add"
+    must(call(method, token, channel=channel, timestamp=args.ts, name=args.emoji.strip(":")))
+    print(json.dumps({"ok": True}))
+
+
+def cmd_permalink(args, token):
+    channel = resolve_channel(token, args.channel)
+    r = must(call("chat.getPermalink", token, channel=channel, message_ts=args.ts))
+    print(r["permalink"])
+
+
+def cmd_upload(args, token):
+    """Upload a file via the external-upload flow (new API)."""
+    channel = resolve_channel(token, args.channel)
+    path = Path(args.file)
+    data = path.read_bytes()
+    r = must(call(
+        "files.getUploadURLExternal", token,
+        filename=path.name, length=str(len(data)),
+    ))
+    upload_url = r["upload_url"]
+    file_id = r["file_id"]
+
+    ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    req = urllib.request.Request(
+        upload_url, data=data, method="POST",
+        headers={"Content-Type": ctype},
+    )
+    with urllib.request.urlopen(req) as resp:
+        resp.read()
+
+    files_arg = [{"id": file_id, "title": args.title or path.name}]
+    r = must(call(
+        "files.completeUploadExternal", token,
+        files=files_arg,
+        channel_id=channel,
+        initial_comment=args.text,
+        thread_ts=args.thread,
+    ))
+    print(json.dumps({"ok": True, "files": r.get("files", [])}))
+
+
+def cmd_resolve(args, token):
+    print(resolve_channel(token, args.target))
+
+
+def cmd_whoami(args, token):
+    r = must(call("auth.test", token))
+    print(json.dumps({k: r[k] for k in ("user", "user_id", "team", "team_id", "url") if k in r}))
+
+
+def cmd_raw(args, token):
+    """Call any Slack method with --field key=value pairs. JSON values accepted."""
+    params = {}
+    for kv in args.field or []:
+        k, _, v = kv.partition("=")
+        s = v.strip()
+        if s.startswith("[") or s.startswith("{"):
+            try:
+                params[k] = json.loads(s)
+                continue
+            except json.JSONDecodeError:
+                pass
+        params[k] = v
+    r = call(args.method, token, **params)
+    print(json.dumps(r, indent=2))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="slack", description="Slack sender using a user token.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("send", help="post a message to a channel/DM")
+    s.add_argument("channel", help="#name | @handle | email | C.../D.../U...")
+    s.add_argument("text")
+    s.add_argument("--thread", help="thread ts to reply inside")
+    s.add_argument("--blocks", help="Block Kit JSON string or @path to file")
+    s.set_defaults(fn=cmd_send)
+
+    s = sub.add_parser("dm", help="DM a user by handle, email, or id")
+    s.add_argument("target")
+    s.add_argument("text")
+    s.add_argument("--thread")
+    s.add_argument("--blocks")
+    s.set_defaults(fn=cmd_dm)
+
+    s = sub.add_parser("reply", help="reply inside a thread")
+    s.add_argument("channel")
+    s.add_argument("thread_ts")
+    s.add_argument("text")
+    s.add_argument("--blocks")
+    s.set_defaults(fn=cmd_reply)
+
+    s = sub.add_parser("update", help="edit a message you sent")
+    s.add_argument("channel")
+    s.add_argument("ts")
+    s.add_argument("text")
+    s.add_argument("--blocks")
+    s.set_defaults(fn=cmd_update)
+
+    s = sub.add_parser("delete", help="delete a message you sent")
+    s.add_argument("channel")
+    s.add_argument("ts")
+    s.set_defaults(fn=cmd_delete)
+
+    s = sub.add_parser("react", help="add or remove a reaction")
+    s.add_argument("channel")
+    s.add_argument("ts")
+    s.add_argument("emoji")
+    s.add_argument("--remove", action="store_true")
+    s.set_defaults(fn=cmd_react)
+
+    s = sub.add_parser("permalink", help="get the permalink for a message")
+    s.add_argument("channel")
+    s.add_argument("ts")
+    s.set_defaults(fn=cmd_permalink)
+
+    s = sub.add_parser("upload", help="upload a file to a channel/DM")
+    s.add_argument("channel")
+    s.add_argument("file")
+    s.add_argument("--text", help="initial comment")
+    s.add_argument("--title", help="file title (defaults to filename)")
+    s.add_argument("--thread")
+    s.set_defaults(fn=cmd_upload)
+
+    s = sub.add_parser("resolve", help="print the channel id for a #name / @handle / email")
+    s.add_argument("target")
+    s.set_defaults(fn=cmd_resolve)
+
+    s = sub.add_parser("whoami", help="print auth.test result")
+    s.set_defaults(fn=cmd_whoami)
+
+    s = sub.add_parser("raw", help="call any Slack method, e.g. raw conversations.history --field channel=C123")
+    s.add_argument("method")
+    s.add_argument("--field", action="append", help="key=value pair; JSON values auto-parsed")
+    s.set_defaults(fn=cmd_raw)
+
+    args = p.parse_args()
+    args.fn(args, get_token())
+
+
+if __name__ == "__main__":
+    main()

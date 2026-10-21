@@ -6,6 +6,7 @@ Agent skills I use with Claude Code and Codex, one per directory under
 | Skill | What it does |
 |---|---|
 | [retro](skills/retro/SKILL.md) | Retrospect on a session and derive the shortest route to the same endpoint |
+| [slack-send](skills/slack-send/SKILL.md) | Send Slack messages with the user token, bypassing MCP so there's no "sent with Claude" footer |
 
 ## Install
 
