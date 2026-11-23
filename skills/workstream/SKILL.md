@@ -44,10 +44,10 @@ recommendation:
 - **Whether** a workstream is wanted, when the user only described the work
   (workstream / a plain branch in the one repo / nothing yet).
 - **Names**: two or three candidate slugs, the branch name per repo, and the
-  terminal space or session name.
+  session name.
 - **Which repos**, and the **base branch** for each when more than one is
   plausible.
-- **Every write** (folders, worktrees, spaces, removals, archive moves): shown
+- **Every write** (folders, worktrees, removals, archive moves): shown
   as a plan and run on approval.
 
 `status` is read-only and needs no questions.
@@ -89,18 +89,11 @@ not given is asked.
 6. **Create.** `mkdir -p` the folder, `artifacts/` and `repos/`; run the
    worktree commands; fill `CLAUDE.md` and `LOG.md` from the templates (first
    LOG entry: created, with ticket and branches), as approved.
-7. **Open it.** Ask how, offering what is available:
-   - Inside Herdr (`$HC_TERMINAL_ID` set and `herdr-app` on the path), a new
-     space. Confirm the space name; `"<KEY> <slug>"` is the suggestion:
-     ```sh
-     herdr-app do space.new --name "<KEY> <slug>" \
-       --folder <ws>/<slug> --tab claude \
-       --argv '["claude","-n","<slug>"]' \
-       --task "Read CLAUDE.md and LOG.md, then start on Next steps."
-     ```
-     Check the reply for an `error`, then `herdr-app ls` to confirm the space.
-   - Otherwise give the user the command: `cd <ws>/<slug> && claude -n <slug>`.
-   - Or continue in this session, if the user prefers.
+7. **Open it.** Ask how:
+   - a new session, started by the user: give the command
+     `cd <ws>/<slug> && claude -n <slug> "Read CLAUDE.md and LOG.md, then start on Next steps."`
+     (confirm the session name; `<slug>` is the suggestion);
+   - or continue in this session, if the user prefers.
 8. Report the folder, branches and how to get into it. Unless the user chose
    to continue here, the work happens in that session, not this one.
 
@@ -108,12 +101,13 @@ not given is asked.
 
 No slug given: list the workstreams (as `status`) and ask which.
 
-1. In Herdr, `herdr-app ls`: if a space's `folder` is the workstream folder,
-   say so and switch to it with `herdr-app do space.select --id <space id>`.
-2. Otherwise open it as in `new` step 7, with:
-   - `claude --continue` if a session exists for the folder: any `*.jsonl` in
-     `~/.claude/projects/<key>/`, where `<key>` is the folder path with every
-     `/` and `.` replaced by `-`;
+1. If a session is already running in the folder
+   (`lsof -d cwd -Fn | grep <ws>/<slug>`), say so and stop: the user switches
+   to it.
+2. Otherwise give the command to open it, as in `new` step 7:
+   - `cd <ws>/<slug> && claude --continue` if a session exists for the folder:
+     any `*.jsonl` in `~/.claude/projects/<key>/`, where `<key>` is the folder
+     path with every `/` and `.` replaced by `-`;
    - else `claude -n <slug>` with the same task as `new`.
 3. Interactive `--continue` ignores sessions run with `claude -p`. If it
    reports "No conversation found to continue", start fresh there:
@@ -185,7 +179,7 @@ live. Main checkouts are never touched.
    the archive.
 4. On approval run the accepted items, then move the context to
    `<ws>/_archive/<slug>/` (`CLAUDE.md`, `LOG.md`, `artifacts/`; the now-empty
-   `repos/` goes). Close its terminal space only if the user asks.
+   `repos/` goes).
 
 ## Working inside a workstream
 
